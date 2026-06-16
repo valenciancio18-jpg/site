@@ -1,0 +1,1161 @@
+<?php
+require_once __DIR__ . "/db.php";
+
+/* =====================================
+   FUNCIONES AUXILIARES
+===================================== */
+
+// Convierte nombres de columna (ej: "razon_social") en etiquetas legibles (ej: "Razon Social")
+function formatLabel($campo) {
+    return ucwords(str_replace('_', ' ', $campo));
+}
+
+/* =====================================
+   CONFIGURACION GENERAL
+===================================== */
+
+$views = [
+    'dashboard',
+    'clientes',
+    'ventas',
+    'productos',
+    'empleados',
+    'proveedores',
+    'gastos'
+];
+
+$view = $_GET['view'] ?? 'dashboard';
+
+if(!in_array($view, $views)){
+    $view = 'dashboard';
+}
+
+$action = $_GET['action'] ?? '';
+
+/* =====================================
+   DASHBOARD API
+===================================== */
+
+if($action == "api"){
+
+    header("Content-Type: application/json; charset=utf-8");
+
+    // =========================
+    // VENTAS
+    // =========================
+    $resVentas = $conn->query("
+        SELECT DATE(fecha) AS fecha,
+               COALESCE(SUM(total),0) AS total
+        FROM ventas
+        GROUP BY DATE(fecha)
+        ORDER BY fecha ASC
+    ");
+
+    $ventas = $resVentas
+        ? $resVentas->fetch_all(MYSQLI_ASSOC)
+        : [];
+
+    // =========================
+    // GASTOS
+    // =========================
+    $resGastos = $conn->query("
+        SELECT DATE(fecha) AS fecha,
+               COALESCE(SUM(monto),0) AS total
+        FROM gastos
+        GROUP BY DATE(fecha)
+        ORDER BY fecha ASC
+    ");
+
+    $gastos = $resGastos
+        ? $resGastos->fetch_all(MYSQLI_ASSOC)
+        : [];
+
+    // =========================
+    // KPIS
+    // =========================
+    $kpis = [
+        "ventas" => (int)($conn->query("
+            SELECT COALESCE(SUM(total),0)
+            FROM ventas
+        ")?->fetch_row()[0] ?? 0),
+
+        "clientes" => (int)($conn->query("
+            SELECT COUNT(*)
+            FROM clientes
+        ")?->fetch_row()[0] ?? 0),
+
+        "productos" => (int)($conn->query("
+            SELECT COUNT(*)
+            FROM productos
+        ")?->fetch_row()[0] ?? 0),
+
+        "empleados" => (int)($conn->query("
+            SELECT COUNT(*)
+            FROM empleados
+        ")?->fetch_row()[0] ?? 0),
+    ];
+
+    // =========================
+    // OUTPUT JSON SEGURO
+    // =========================
+    echo json_encode([
+        "ventas" => $ventas,
+        "gastos" => $gastos,
+        "kpis" => $kpis
+    ]);
+
+    exit;
+}
+
+/* =====================================
+   ELIMINAR REGISTRO
+===================================== */
+
+// FIX: se excluye "dashboard" porque no es una tabla real de la base
+if (isset($_GET['delete']) && $view !== 'dashboard') {
+
+    $id = (int) $_GET['delete'];
+
+    $stmt = $conn->prepare("DELETE FROM $view WHERE id = ?");
+    $stmt->bind_param("i", $id);
+    $stmt->execute();
+
+    header("Location: index.php?view=$view");
+    exit;
+}
+
+/* =====================================
+   GUARDAR NUEVO REGISTRO
+===================================== */
+
+if (isset($_POST['guardar']) && $view !== 'dashboard') {
+
+    $res = $conn->query("SHOW COLUMNS FROM $view");
+
+    $columnas = [];
+    $placeholders = [];
+    $tipos = "";
+    $valores = [];
+
+    if ($res) {
+        while ($c = $res->fetch_assoc()) {
+
+            if ($c['Field'] === 'id') continue;
+
+            $columnas[] = $c['Field'];
+            $placeholders[] = "?";
+
+            $tipos .= "s";
+            $valores[] = $_POST[$c['Field']] ?? "";
+        }
+    }
+
+    if (!empty($columnas)) {
+
+        $sql = "
+            INSERT INTO $view (" . implode(',', $columnas) . ")
+            VALUES (" . implode(',', $placeholders) . ")
+        ";
+
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param($tipos, ...$valores);
+        $stmt->execute();
+    }
+
+    header("Location: index.php?view=$view");
+    exit;
+}
+
+/* =====================================
+   EDITAR REGISTRO (UPDATE)
+===================================== */
+
+// FIX: ahora usa prepared statements en vez de concatenar el SQL a mano
+if (isset($_POST['actualizar']) && $view !== 'dashboard') {
+
+    $id = (int) $_POST['id'];
+
+    $res = $conn->query("SHOW COLUMNS FROM $view");
+
+    $sets = [];
+    $tipos = "";
+    $valores = [];
+
+    if ($res) {
+        while ($c = $res->fetch_assoc()) {
+
+            if ($c['Field'] === 'id') continue;
+
+            $campo = $c['Field'];
+
+            $sets[] = "$campo = ?";
+            $tipos .= "s";
+            $valores[] = $_POST[$campo] ?? '';
+        }
+    }
+
+    if (!empty($sets)) {
+
+        $tipos .= "i";
+        $valores[] = $id;
+
+        $sql = "
+            UPDATE $view
+            SET " . implode(',', $sets) . "
+            WHERE id = ?
+        ";
+
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param($tipos, ...$valores);
+        $stmt->execute();
+    }
+
+    header("Location: index.php?view=$view");
+    exit;
+}
+
+/* =====================================
+   FORMULARIO EDICIÓN
+===================================== */
+
+$fila_edicion = null;
+
+// FIX: también usa prepared statement para la consulta del registro a editar
+if (isset($_GET['edit']) && $view !== 'dashboard') {
+
+    $id = (int) $_GET['edit'];
+
+    $stmt = $conn->prepare("SELECT * FROM $view WHERE id = ?");
+    $stmt->bind_param("i", $id);
+    $stmt->execute();
+
+    $res = $stmt->get_result();
+    $fila_edicion = $res ? $res->fetch_assoc() : null;
+}
+
+?>
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>ERP Empresarial</title>
+
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+
+body {
+    background: #f4f6f9;
+    font-family: Arial, sans-serif;
+}
+
+.sidebar {
+    width: 260px;
+    height: 100vh;
+    position: fixed;
+    background: #0d2344;
+    color: white;
+    overflow-y: auto;
+}
+
+.sidebar h4 {
+    padding: 20px;
+}
+
+.sidebar a {
+    color: white;
+    text-decoration: none;
+    display: block;
+    padding: 12px 20px;
+}
+
+.sidebar a:hover {
+    background: #1d4ed8;
+}
+
+.sidebar .active {
+    background: #2563eb;
+}
+
+.content {
+    margin-left: 260px;
+    padding: 20px;
+}
+
+.topbar {
+    background: white;
+    padding: 15px;
+    border-radius: 10px;
+    margin-bottom: 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.card-dashboard {
+    border: none;
+    border-radius: 15px;
+    box-shadow: 0 2px 10px rgba(0,0,0,.08);
+}
+
+.icon-circle {
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    font-size: 24px;
+}
+
+.green { background: #22c55e; }
+.blue { background: #3b82f6; }
+.purple { background: #8b5cf6; }
+.orange { background: #f59e0b; }
+.red { background: #ef4444; }
+
+.table-card {
+    background: white;
+    padding: 20px;
+    border-radius: 15px;
+    box-shadow: 0 2px 10px rgba(0,0,0,.08);
+    margin-bottom: 20px;
+}
+
+.table-card h4 {
+    color: #0d2344;
+    font-weight: 600;
+    margin-bottom: 15px;
+}
+
+.table-card table {
+    margin-bottom: 0;
+}
+
+.chart-card {
+    background: white;
+    padding: 20px;
+    border-radius: 15px;
+    box-shadow: 0 2px 10px rgba(0,0,0,.08);
+    margin-bottom: 20px;
+}
+
+.modal-bg {
+    display: none;
+    position: fixed;
+    z-index: 999;
+    inset: 0;
+    background: rgba(0,0,0,.55);
+    overflow: auto;
+    backdrop-filter: blur(2px);
+}
+
+.modal-box {
+    background: white;
+    width: 600px;
+    max-width: 95%;
+    padding: 25px;
+    border-radius: 15px;
+    margin: 60px auto;
+    box-shadow: 0 15px 40px rgba(0,0,0,.25);
+    animation: modalIn .2s ease-out;
+}
+
+@keyframes modalIn {
+    from {
+        transform: translateY(-10px);
+        opacity: 0;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+.btn {
+    border-radius: 10px;
+    transition: all .2s ease-in-out;
+}
+
+.btn:hover {
+    transform: translateY(-1px);
+}
+
+.form-control {
+    border-radius: 10px;
+    box-shadow: none;
+}
+
+.form-control:focus {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 0.2rem rgba(59,130,246,.25);
+}
+
+.table-hover tbody tr {
+    transition: background .2s ease;
+}
+
+.table-hover tbody tr:hover {
+    background: #f1f5f9;
+}
+
+.footer {
+    margin-top: 30px;
+    background: white;
+    padding: 15px;
+    border-radius: 10px;
+    text-align: center;
+    color: #64748b;
+    box-shadow: 0 2px 10px rgba(0,0,0,.08);
+    font-size: 0.9rem;
+}
+
+.badge {
+    font-weight: 600;
+    padding: 6px 12px;
+}
+
+.badge-success { background: #22c55e; color: white; }
+.badge-danger { background: #ef4444; color: white; }
+.badge-warning { background: #f59e0b; color: white; }
+.badge-info { background: #3b82f6; color: white; }
+
+.table-sm td {
+    vertical-align: middle;
+    padding: 0.5rem;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="sidebar">
+
+<h4>
+<i class="fa-solid fa-building"></i>
+ERP Empresarial
+</h4>
+
+<a href="?view=dashboard" class="<?= ($view === 'dashboard') ? 'active' : '' ?>">
+<i class="fa-solid fa-house"></i>
+Dashboard
+</a>
+
+<hr>
+
+<a href="?view=ventas" class="<?= ($view === 'ventas') ? 'active' : '' ?>">
+<i class="fa-solid fa-cart-shopping"></i>
+Ventas
+</a>
+
+<a href="?view=clientes" class="<?= ($view === 'clientes') ? 'active' : '' ?>">
+<i class="fa-solid fa-users"></i>
+Clientes
+</a>
+
+<a href="?view=productos" class="<?= ($view === 'productos') ? 'active' : '' ?>">
+<i class="fa-solid fa-box"></i>
+Productos
+</a>
+
+<a href="?view=empleados" class="<?= ($view === 'empleados') ? 'active' : '' ?>">
+<i class="fa-solid fa-user-tie"></i>
+Empleados
+</a>
+
+<a href="?view=proveedores" class="<?= ($view === 'proveedores') ? 'active' : '' ?>">
+<i class="fa-solid fa-truck"></i>
+Proveedores
+</a>
+
+<a href="?view=gastos" class="<?= ($view === 'gastos') ? 'active' : '' ?>">
+<i class="fa-solid fa-money-bill"></i>
+Gastos
+</a>
+
+</div>
+
+<div class="content">
+
+<div class="topbar">
+<div>
+<h2>Panel de Administración</h2>
+<p>Sistema de Gestión de datos</p>
+</div>
+
+<div class="d-flex gap-2 align-items-center">
+<div class="input-group" style="width: 250px;">
+<input type="text" class="form-control" id="filtro" placeholder="Buscar...">
+<button class="btn btn-outline-secondary" type="button" onclick="aplicarFiltro()">
+<i class="fa-solid fa-search"></i>
+</button>
+</div>
+<button class="btn btn-light">
+<?= date("d/m/Y") ?>
+</button>
+<?php if($view !== 'dashboard' && !isset($_GET['edit'])): ?>
+<button class="btn btn-primary" onclick="document.getElementById('modal').style.display='block'">
+<i class="fa-solid fa-plus"></i> Nuevo
+</button>
+<?php endif; ?>
+</div>
+</div>
+
+<?php if($view == "dashboard"): ?>
+
+<div class="row">
+
+<div class="col-md-3">
+<div class="card card-dashboard p-3">
+<div class="d-flex">
+<div class="icon-circle green me-3"><i class="fa-solid fa-dollar-sign"></i></div>
+<div>
+<h6>Ventas Totales</h6>
+<h3 id="kpiVentas">0</h3>
+</div>
+</div>
+</div>
+</div>
+
+<div class="col-md-3">
+<div class="card card-dashboard p-3">
+<div class="d-flex">
+<div class="icon-circle blue me-3"><i class="fa-solid fa-users"></i></div>
+<div>
+<h6>Clientes</h6>
+<h3 id="kpiClientes">0</h3>
+</div>
+</div>
+</div>
+</div>
+
+<div class="col-md-3">
+<div class="card card-dashboard p-3">
+<div class="d-flex">
+<div class="icon-circle purple me-3"><i class="fa-solid fa-box"></i></div>
+<div>
+<h6>Productos</h6>
+<h3 id="kpiProductos">0</h3>
+</div>
+</div>
+</div>
+</div>
+
+<div class="col-md-3">
+<div class="card card-dashboard p-3">
+<div class="d-flex">
+<div class="icon-circle orange me-3"><i class="fa-solid fa-user-tie"></i></div>
+<div>
+<h6>Empleados</h6>
+<h3 id="kpiEmpleados">0</h3>
+</div>
+</div>
+</div>
+</div>
+
+</div>
+
+<div class="row mt-4">
+
+<div class="col-md-8">
+<div class="chart-card">
+<h4>Ventas por Día</h4>
+<canvas id="ventasChart"></canvas>
+</div>
+</div>
+
+<div class="col-md-4">
+<div class="chart-card">
+<h4>Gastos por Día</h4>
+<canvas id="gastosChart"></canvas>
+</div>
+</div>
+
+</div>
+
+<!-- Tablas con datos relevantes -->
+<div class="row mt-4">
+
+<div class="col-md-6">
+<div class="table-card">
+<h4><i class="fa-solid fa-cart-shopping"></i> Últimas Ventas</h4>
+<table class="table table-striped table-hover table-sm">
+<thead>
+<tr>
+<th>ID</th>
+<th>Cliente</th>
+<th>Total</th>
+<th>Fecha</th>
+</tr>
+</thead>
+<tbody>
+<?php
+$q = $conn->query("
+    SELECT v.id, COALESCE(c.nombre,'Sin cliente') AS cliente, v.total, DATE(v.fecha) as fecha
+    FROM ventas v
+    LEFT JOIN clientes c ON c.id = v.cliente_id
+    ORDER BY v.id DESC
+    LIMIT 5
+");
+if ($q && $q->num_rows > 0):
+    while ($r = $q->fetch_assoc()):
+?>
+<tr>
+<td><?= $r['id'] ?></td>
+<td><?= htmlspecialchars($r['cliente']) ?></td>
+<td>$<?= number_format($r['total'], 2) ?></td>
+<td><?= $r['fecha'] ?></td>
+</tr>
+<?php endwhile; else: ?>
+<tr><td colspan="4" class="text-center text-muted">Sin ventas</td></tr>
+<?php endif; ?>
+</tbody>
+</table>
+</div>
+</div>
+
+<div class="col-md-6">
+<div class="table-card">
+<h4><i class="fa-solid fa-exclamation-triangle"></i> Stock Bajo</h4>
+<table class="table table-striped table-hover table-sm">
+<thead>
+<tr>
+<th>Producto</th>
+<th>Stock</th>
+<th>Estado</th>
+</tr>
+</thead>
+<tbody>
+<?php
+$q = $conn->query("
+    SELECT nombre, stock
+    FROM productos
+    WHERE stock <= 10
+    ORDER BY stock ASC
+    LIMIT 5
+");
+if ($q && $q->num_rows > 0):
+    while ($r = $q->fetch_assoc()):
+        $badge = $r['stock'] <= 3 ? 'badge-danger' : 'badge-warning';
+?>
+<tr>
+<td><?= htmlspecialchars($r['nombre']) ?></td>
+<td><?= $r['stock'] ?></td>
+<td><span class="badge <?= $badge ?>"><?= $r['stock'] <= 3 ? 'Crítico' : 'Bajo' ?></span></td>
+</tr>
+<?php endwhile; else: ?>
+<tr><td colspan="3" class="text-center text-muted">Stock en niveles normales</td></tr>
+<?php endif; ?>
+</tbody>
+</table>
+</div>
+</div>
+
+</div>
+
+<?php elseif(isset($_GET['edit']) && $fila_edicion): ?>
+
+<div class="table-card">
+<h3>Editar Registro</h3>
+
+<form method="POST">
+<input type="hidden" name="id" value="<?= $fila_edicion['id'] ?>">
+
+<?php foreach($fila_edicion as $campo => $valor): ?>
+<?php if($campo === "id") continue; ?>
+
+<div class="mb-3">
+<label class="form-label"><?= formatLabel($campo) ?></label>
+<input type="text" name="<?= htmlspecialchars($campo) ?>" value="<?= htmlspecialchars($valor) ?>" class="form-control">
+</div>
+
+<?php endforeach; ?>
+
+<button type="submit" name="actualizar" class="btn btn-primary">Actualizar</button>
+<a href="?view=<?= $view ?>" class="btn btn-secondary">Cancelar</a>
+
+</form>
+</div>
+
+<?php else: ?>
+
+<!-- Mini resúmenes por vista -->
+<?php
+$datos_resumen = [];
+switch($view) {
+    case 'clientes':
+        $res = $conn->query("SELECT COUNT(*) as total FROM clientes");
+        $datos_resumen = $res ? $res->fetch_assoc() : ['total' => 0];
+        break;
+    case 'ventas':
+        $res = $conn->query("SELECT COUNT(*) as total, COALESCE(SUM(total),0) as monto FROM ventas");
+        $datos_resumen = $res ? $res->fetch_assoc() : ['total' => 0, 'monto' => 0];
+        $res2 = $conn->query("SELECT COALESCE(AVG(total),0) as promedio FROM ventas");
+        $prom = $res2 ? $res2->fetch_assoc() : ['promedio' => 0];
+        $datos_resumen['promedio'] = $prom['promedio'];
+        break;
+    case 'productos':
+        $res = $conn->query("SELECT COUNT(*) as total, COALESCE(SUM(stock),0) as stock FROM productos");
+        $datos_resumen = $res ? $res->fetch_assoc() : ['total' => 0, 'stock' => 0];
+        $res2 = $conn->query("SELECT COUNT(*) as bajo_stock FROM productos WHERE stock <= 10");
+        $bajo = $res2 ? $res2->fetch_assoc() : ['bajo_stock' => 0];
+        $datos_resumen['bajo_stock'] = $bajo['bajo_stock'];
+        break;
+    case 'empleados':
+        $res = $conn->query("SELECT COUNT(*) as total FROM empleados");
+        $datos_resumen = $res ? $res->fetch_assoc() : ['total' => 0];
+        break;
+    case 'proveedores':
+        $res = $conn->query("SELECT COUNT(*) as total FROM proveedores");
+        $datos_resumen = $res ? $res->fetch_assoc() : ['total' => 0];
+        break;
+    case 'gastos':
+        $res = $conn->query("SELECT COUNT(*) as total, COALESCE(SUM(monto),0) as monto FROM gastos");
+        $datos_resumen = $res ? $res->fetch_assoc() : ['total' => 0, 'monto' => 0];
+        $res2 = $conn->query("SELECT COALESCE(AVG(monto),0) as promedio FROM gastos");
+        $prom = $res2 ? $res2->fetch_assoc() : ['promedio' => 0];
+        $datos_resumen['promedio'] = $prom['promedio'];
+        break;
+}
+?>
+
+<div class="row mb-4">
+<?php if($view === 'clientes'): ?>
+    <div class="col-md-4">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle blue me-3"><i class="fa-solid fa-users"></i></div>
+                <div>
+                    <h6>Total Clientes</h6>
+                    <h3><?= $datos_resumen['total'] ?? 0 ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<?php elseif($view === 'ventas'): ?>
+    <div class="col-md-3">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle blue me-3"><i class="fa-solid fa-receipt"></i></div>
+                <div>
+                    <h6>Total Ventas</h6>
+                    <h3><?= $datos_resumen['total'] ?? 0 ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle green me-3"><i class="fa-solid fa-dollar-sign"></i></div>
+                <div>
+                    <h6>Monto Total</h6>
+                    <h3>$<?= number_format($datos_resumen['monto'] ?? 0, 2) ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle purple me-3"><i class="fa-solid fa-chart-line"></i></div>
+                <div>
+                    <h6>Promedio por Venta</h6>
+                    <h3>$<?= number_format($datos_resumen['promedio'] ?? 0, 2) ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<?php elseif($view === 'productos'): ?>
+    <div class="col-md-3">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle purple me-3"><i class="fa-solid fa-box"></i></div>
+                <div>
+                    <h6>Total Productos</h6>
+                    <h3><?= $datos_resumen['total'] ?? 0 ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle green me-3"><i class="fa-solid fa-warehouse"></i></div>
+                <div>
+                    <h6>Stock Total</h6>
+                    <h3><?= $datos_resumen['stock'] ?? 0 ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle orange me-3"><i class="fa-solid fa-exclamation-triangle"></i></div>
+                <div>
+                    <h6>Stock Bajo</h6>
+                    <h3><?= $datos_resumen['bajo_stock'] ?? 0 ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<?php elseif($view === 'empleados'): ?>
+    <div class="col-md-4">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle orange me-3"><i class="fa-solid fa-user-tie"></i></div>
+                <div>
+                    <h6>Total Empleados</h6>
+                    <h3><?= $datos_resumen['total'] ?? 0 ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<?php elseif($view === 'proveedores'): ?>
+    <div class="col-md-4">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle green me-3"><i class="fa-solid fa-truck"></i></div>
+                <div>
+                    <h6>Total Proveedores</h6>
+                    <h3><?= $datos_resumen['total'] ?? 0 ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<?php elseif($view === 'gastos'): ?>
+    <div class="col-md-3">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle red me-3"><i class="fa-solid fa-money-bill"></i></div>
+                <div>
+                    <h6>Total Gastos</h6>
+                    <h3><?= $datos_resumen['total'] ?? 0 ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle orange me-3"><i class="fa-solid fa-dollar-sign"></i></div>
+                <div>
+                    <h6>Monto Total Gastado</h6>
+                    <h3>$<?= number_format($datos_resumen['monto'] ?? 0, 2) ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card card-dashboard p-3">
+            <div class="d-flex">
+                <div class="icon-circle purple me-3"><i class="fa-solid fa-chart-bar"></i></div>
+                <div>
+                    <h6>Gasto Promedio</h6>
+                    <h3>$<?= number_format($datos_resumen['promedio'] ?? 0, 2) ?></h3>
+                </div>
+            </div>
+        </div>
+    </div>
+<?php endif; ?>
+</div>
+
+<div class="table-card">
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+<h4><?= ucfirst($view) ?></h4>
+<button class="btn btn-sm btn-primary" onclick="document.getElementById('modal').style.display='block'">
+<i class="fa-solid fa-plus"></i> Nuevo
+</button>
+</div>
+
+<table class="table table-striped table-hover">
+<thead>
+<tr>
+<?php
+$res = $conn->query("SHOW COLUMNS FROM $view");
+if ($res):
+    while($col = $res->fetch_assoc()):
+?>
+<th><?= formatLabel($col['Field']) ?></th>
+<?php
+    endwhile;
+endif;
+?>
+<th>Acciones</th>
+</tr>
+</thead>
+<tbody>
+<?php
+$q = $conn->query("SELECT * FROM $view LIMIT 50");
+if ($q && $q->num_rows > 0):
+    while ($r = $q->fetch_assoc()):
+?>
+<tr>
+<?php foreach($r as $valor): ?>
+<td><?= htmlspecialchars((string)$valor) ?></td>
+<?php endforeach; ?>
+<td>
+<a href="?view=<?= $view ?>&edit=<?= $r['id'] ?>" class="btn btn-sm btn-warning">
+<i class="fa-solid fa-edit"></i>
+</a>
+<a href="?view=<?= $view ?>&delete=<?= $r['id'] ?>" class="btn btn-sm btn-danger" onclick="return confirm('¿Eliminar?')">
+<i class="fa-solid fa-trash"></i>
+</a>
+</td>
+</tr>
+<?php
+    endwhile;
+else:
+?>
+<tr>
+<td colspan="10" class="text-center text-muted">Sin registros</td>
+</tr>
+<?php endif; ?>
+</tbody>
+</table>
+</div>
+
+<?php endif; ?>
+
+</div> <!-- FIN CONTENT -->
+
+<!-- ============================================================
+     MODAL NUEVO REGISTRO
+     FIX: todo el modal queda dentro de "$view !== 'dashboard'"
+     para que nunca se intente hacer SHOW COLUMNS FROM dashboard
+============================================================ -->
+
+<?php if ($view !== 'dashboard'): ?>
+
+<div id="modal" class="modal-bg">
+
+<div class="modal-box">
+
+<h3>Nuevo Registro</h3>
+
+<form method="POST">
+
+<?php
+$res = $conn->query("SHOW COLUMNS FROM `$view`");
+
+if ($res):
+    while($campo = $res->fetch_assoc()):
+        if($campo['Field'] === "id") continue;
+?>
+
+<div class="mb-3">
+<label class="form-label"><?= formatLabel($campo['Field']) ?></label>
+<input type="text" name="<?= htmlspecialchars($campo['Field']) ?>" class="form-control">
+</div>
+
+<?php
+    endwhile;
+endif;
+?>
+
+<button type="submit" name="guardar" class="btn btn-success">Guardar</button>
+<button type="button" class="btn btn-secondary" onclick="document.getElementById('modal').style.display='none'">Cancelar</button>
+
+</form>
+
+</div>
+
+</div>
+
+<?php endif; ?>
+
+<div class="footer">
+ERP Empresarial © <?= date("Y") ?>
+<br>
+Sistema de Gestión Integral
+</div>
+
+<script>
+
+// Función para filtrar tabla
+function aplicarFiltro() {
+    const filtro = document.getElementById('filtro').value.toLowerCase().trim();
+    const tabla = document.querySelector('table tbody');
+    
+    if (!tabla) return;
+    
+    const filas = tabla.querySelectorAll('tr');
+    let coincidencias = 0;
+    
+    filas.forEach(fila => {
+        const texto = fila.textContent.toLowerCase();
+        if (filtro === '' || texto.includes(filtro)) {
+            fila.style.display = '';
+            coincidencias++;
+        } else {
+            fila.style.display = 'none';
+        }
+    });
+    
+    console.log('🔍 Filtro aplicado: "' + filtro + '" - ' + coincidencias + ' resultados');
+}
+
+// Inicializar eventos al cargar DOM
+document.addEventListener('DOMContentLoaded', function() {
+    
+    // 1. Cargar dashboard si existen los elementos
+    const ventasChart = document.getElementById('ventasChart');
+    const gastosChart = document.getElementById('gastosChart');
+    if (ventasChart && gastosChart) {
+        console.log('📊 Inicializando Dashboard...');
+        cargarDashboard();
+    }
+    
+    // 2. Filtro en tiempo real y Enter
+    const filtroInput = document.getElementById('filtro');
+    if (filtroInput) {
+        filtroInput.addEventListener('keyup', function(e) {
+            if (e.key === 'Enter') {
+                aplicarFiltro();
+            } else {
+                aplicarFiltro();
+            }
+        });
+    }
+    
+    // 3. Control del modal
+    const modal = document.getElementById('modal');
+    if (modal) {
+        window.addEventListener('click', function (event) {
+            if (event.target === modal) {
+                modal.style.display = 'none';
+            }
+        });
+        
+        document.addEventListener('keydown', function (e) {
+            if (e.key === "Escape") {
+                modal.style.display = 'none';
+            }
+        });
+    }
+});
+
+// Almacenar referencias globales de gráficos
+let ventasChartInstance = null;
+let gastosChartInstance = null;
+
+// API para dashboard
+async function cargarDashboard() {
+    try {
+        const resp = await fetch('?action=api');
+        if (!resp.ok) throw new Error('Error en el servidor: ' + resp.status);
+        
+        const data = await resp.json();
+        
+        console.log('✓ Datos del API cargados:', data);
+
+        // Cargar KPIs
+        if(data.kpis) {
+            console.log('✓ KPIs:', data.kpis);
+            document.getElementById('kpiVentas').innerHTML = '$' + Number(data.kpis.ventas).toLocaleString('es-AR');
+            document.getElementById('kpiClientes').innerHTML = Number(data.kpis.clientes).toLocaleString('es-AR');
+            document.getElementById('kpiProductos').innerHTML = Number(data.kpis.productos).toLocaleString('es-AR');
+            document.getElementById('kpiEmpleados').innerHTML = Number(data.kpis.empleados).toLocaleString('es-AR');
+        }
+        
+        // Destruir gráficos anteriores si existen
+        if (ventasChartInstance) ventasChartInstance.destroy();
+        if (gastosChartInstance) gastosChartInstance.destroy();
+        
+        // Gráfico de ventas
+        if(data.ventas && data.ventas.length > 0) {
+            const ventasCtx = document.getElementById('ventasChart');
+            if (ventasCtx) {
+                ventasChartInstance = new Chart(ventasCtx, {
+                    type: 'line',
+                    data: {
+                        labels: data.ventas.map(x => x.fecha),
+                        datasets: [{
+                            label: 'Ventas por Día',
+                            data: data.ventas.map(x => parseFloat(x.total)),
+                            borderColor: '#3b82f6',
+                            backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 4,
+                            pointBackgroundColor: '#3b82f6',
+                            pointBorderColor: '#fff',
+                            pointBorderWidth: 2
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: true,
+                        plugins: {
+                            legend: { display: true, position: 'top' }
+                        },
+                        scales: {
+                            y: { 
+                                beginAtZero: true,
+                                ticks: { callback: function(value) { return '$' + value.toLocaleString('es-AR'); } }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // Gráfico de gastos
+        if(data.gastos && data.gastos.length > 0) {
+            const gastosCtx = document.getElementById('gastosChart');
+            if (gastosCtx) {
+                gastosChartInstance = new Chart(gastosCtx, {
+                    type: 'bar',
+                    data: {
+                        labels: data.gastos.map(x => x.fecha),
+                        datasets: [{
+                            label: 'Gastos por Día',
+                            data: data.gastos.map(x => parseFloat(x.total)),
+                            backgroundColor: '#ef4444',
+                            borderColor: '#dc2626',
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: true,
+                        plugins: {
+                            legend: { display: true, position: 'top' }
+                        },
+                        scales: {
+                            y: { 
+                                beginAtZero: true,
+                                ticks: { callback: function(value) { return '$' + value.toLocaleString('es-AR'); } }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        
+        console.log('✓ Dashboard cargado correctamente');
+    } catch(error) {
+        console.error('✗ Error cargando dashboard:', error);
+    }
+}
+
+</script>
+
+</body>
+</html>
